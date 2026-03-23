@@ -104,28 +104,54 @@ actor GitHubClient {
         var allCommits: [SearchCommit] = []
         var seenSHAs = Set<String>()
 
+        // Search per-week to stay under the 1000-result API cap
+        let weekRanges = buildWeekRanges(since: since)
+
         for email in emails {
-            var page = 1
-            while true {
-                let query = "author-email:\(email)+author-date:>\(since)"
-                let endpoint = "/search/commits?q=\(query)&per_page=100&page=\(page)&sort=author-date&order=desc"
-                guard let output = runGh(["api", endpoint, "-H", "Accept: application/vnd.github+json"]) else { break }
+            for range in weekRanges {
+                var page = 1
+                while true {
+                    let query = "author-email:\(email)+author-date:\(range)"
+                    let endpoint = "/search/commits?q=\(query)&per_page=100&page=\(page)&sort=author-date&order=desc"
+                    guard let output = runGh(["api", endpoint, "-H", "Accept: application/vnd.github+json"]) else { break }
 
-                let commits = parseSearchResults(output)
-                if commits.isEmpty { break }
+                    let commits = parseSearchResults(output)
+                    if commits.isEmpty { break }
 
-                for c in commits where !seenSHAs.contains(c.sha) {
-                    seenSHAs.insert(c.sha)
-                    allCommits.append(c)
+                    for c in commits where !seenSHAs.contains(c.sha) {
+                        seenSHAs.insert(c.sha)
+                        allCommits.append(c)
+                    }
+
+                    if commits.count < 100 { break }
+                    page += 1
+                    if page > 10 { break }
                 }
-
-                if commits.count < 100 { break }
-                page += 1
-                if page > 10 { break } // safety limit
             }
         }
 
         return allCommits
+    }
+
+    private func buildWeekRanges(since: String) -> [String] {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let startDate = formatter.date(from: since) else { return [">\(since)"] }
+
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        var ranges: [String] = []
+        var current = startDate
+
+        while current < today {
+            let weekEnd = min(calendar.date(byAdding: .day, value: 7, to: current)!, today)
+            let from = formatter.string(from: current)
+            let to = formatter.string(from: weekEnd)
+            ranges.append("\(from)..\(to)")
+            current = calendar.date(byAdding: .day, value: 7, to: current)!
+        }
+
+        return ranges
     }
 
     // MARK: - GraphQL batch stats
