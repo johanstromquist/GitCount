@@ -2,10 +2,21 @@ import Foundation
 
 actor GitHubClient {
     private let emails: [String]
-    private let graphqlBatchSize = 30
+    private let repoBatchSize = 10
 
     init(emails: [String]) {
         self.emails = emails
+    }
+
+    // MARK: - Data types
+
+    private struct CommitInfo: Sendable {
+        let sha: String
+        let repo: String
+        let date: String
+        let message: String
+        let added: Int
+        let deleted: Int
     }
 
     // MARK: - Public API
@@ -13,26 +24,18 @@ actor GitHubClient {
     func fetchContributions() async -> [String: (added: Int, deleted: Int, commits: Int)] {
         guard !emails.isEmpty else { return [:] }
 
-        let since = fourWeeksAgoISO()
-        let commits = await searchAllCommits(since: since)
-        guard !commits.isEmpty else { return [:] }
+        let commits = await fetchAllCommits()
 
-        // Fetch stats via GraphQL in batches
-        let withStats = await fetchStats(for: commits)
-
-        // Aggregate by date
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoFormatterNoFrac = ISO8601DateFormatter()
-        isoFormatterNoFrac.formatOptions = [.withInternetDateTime]
+        let isoFormatterPlain = ISO8601DateFormatter()
 
         var combined: [String: (added: Int, deleted: Int, commits: Int)] = [:]
 
-        for c in withStats {
-            let date: Date? = isoFormatter.date(from: c.date) ?? isoFormatterNoFrac.date(from: c.date)
-            guard let d = date else { continue }
+        for c in commits {
+            guard let d = isoFormatter.date(from: c.date) ?? isoFormatterPlain.date(from: c.date) else { continue }
             let key = dateFormatter.string(from: d)
             let existing = combined[key] ?? (0, 0, 0)
             combined[key] = (existing.added + c.added, existing.deleted + c.deleted, existing.commits + 1)
@@ -44,23 +47,18 @@ actor GitHubClient {
     func fetchDayDetail(date: String) async -> [RepoDayDetail] {
         guard !emails.isEmpty else { return [] }
 
-        let since = fourWeeksAgoISO()
-        let commits = await searchAllCommits(since: since)
-        let withStats = await fetchStats(for: commits)
+        let commits = await fetchAllCommits()
 
-        // Filter to target date and group by repo
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd"
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoFormatterNoFrac = ISO8601DateFormatter()
-        isoFormatterNoFrac.formatOptions = [.withInternetDateTime]
+        let isoFormatterPlain = ISO8601DateFormatter()
 
         var repoDetails: [String: (added: Int, deleted: Int, commits: [RepoCommit])] = [:]
 
-        for c in withStats {
-            let parsed: Date? = isoFormatter.date(from: c.date) ?? isoFormatterNoFrac.date(from: c.date)
-            guard let d = parsed else { continue }
+        for c in commits {
+            guard let d = isoFormatter.date(from: c.date) ?? isoFormatterPlain.date(from: c.date) else { continue }
             let key = dateFormatter.string(from: d)
             guard key == date else { continue }
 
@@ -82,115 +80,62 @@ actor GitHubClient {
         }.sorted { abs($0.added - $0.deleted) > abs($1.added - $1.deleted) }
     }
 
-    // MARK: - Search API (all branches)
+    // MARK: - Core: GraphQL-only approach
 
-    private struct SearchCommit {
-        let sha: String
-        let repo: String // owner/name
-        let date: String
-        let message: String
-    }
+    private func fetchAllCommits() async -> [CommitInfo] {
+        let repos = fetchRepos()
+        guard !repos.isEmpty else { return [] }
 
-    private struct StatsCommit {
-        let sha: String
-        let repo: String
-        let date: String
-        let message: String
-        let added: Int
-        let deleted: Int
-    }
-
-    private func searchAllCommits(since: String) async -> [SearchCommit] {
-        var allCommits: [SearchCommit] = []
+        let since = fourWeeksAgoISO()
+        let emailList = emails.map { "\"\($0)\"" }.joined(separator: ", ")
+        var allCommits: [CommitInfo] = []
         var seenSHAs = Set<String>()
 
-        // Search per-week to stay under the 1000-result API cap
-        let weekRanges = buildWeekRanges(since: since)
-
-        for email in emails {
-            for range in weekRanges {
-                var page = 1
-                while true {
-                    let query = "author-email:\(email)+author-date:\(range)"
-                    let endpoint = "/search/commits?q=\(query)&per_page=100&page=\(page)&sort=author-date&order=desc"
-                    guard let output = runGh(["api", endpoint, "-H", "Accept: application/vnd.github+json"]) else { break }
-
-                    let commits = parseSearchResults(output)
-                    if commits.isEmpty { break }
-
-                    for c in commits where !seenSHAs.contains(c.sha) {
-                        seenSHAs.insert(c.sha)
-                        allCommits.append(c)
-                    }
-
-                    if commits.count < 100 { break }
-                    page += 1
-                    if page > 10 { break }
-                }
-            }
-        }
-
-        return allCommits
-    }
-
-    private func buildWeekRanges(since: String) -> [String] {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        guard let startDate = formatter.date(from: since) else { return [">\(since)"] }
-
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        var ranges: [String] = []
-        var current = startDate
-
-        while current < today {
-            let weekEnd = min(calendar.date(byAdding: .day, value: 7, to: current)!, today)
-            let from = formatter.string(from: current)
-            let to = formatter.string(from: weekEnd)
-            ranges.append("\(from)..\(to)")
-            current = calendar.date(byAdding: .day, value: 7, to: current)!
-        }
-
-        return ranges
-    }
-
-    // MARK: - GraphQL batch stats
-
-    private func fetchStats(for commits: [SearchCommit]) async -> [StatsCommit] {
-        var results: [StatsCommit] = []
-        let batchSize = 50
-
-        for batchStart in stride(from: 0, to: commits.count, by: batchSize) {
-            let end = min(batchStart + batchSize, commits.count)
-            let batch = Array(commits[batchStart..<end])
-
-            // Group this batch by repo for the query structure
-            var repoMap: [String: [(index: Int, commit: SearchCommit)]] = [:]
-            for (i, c) in batch.enumerated() {
-                repoMap[c.repo, default: []].append((i, c))
-            }
+        // Query repos in batches
+        for batchStart in stride(from: 0, to: repos.count, by: repoBatchSize) {
+            let end = min(batchStart + repoBatchSize, repos.count)
+            let batch = Array(repos[batchStart..<end])
 
             var fragments: [String] = []
-            var lookups: [(alias: String, commit: SearchCommit)] = []
+            var repoNames: [Int: String] = [:]
 
-            for (ri, (repo, entries)) in repoMap.enumerated() {
-                let parts = repo.split(separator: "/")
+            for (ri, repo) in batch.enumerated() {
+                let parts = repo.nameWithOwner.split(separator: "/")
                 guard parts.count == 2 else { continue }
+                repoNames[ri] = repo.nameWithOwner
 
-                var objectFragments: [String] = []
-                for (ci, entry) in entries.enumerated() {
-                    let alias = "c\(ri)_\(ci)"
-                    objectFragments.append("""
-                      \(alias): object(expression: "\(entry.commit.sha)") {
-                        ... on Commit { additions deletions }
+                // Always query default branch
+                var branchQueries = """
+                  defaultBranch: defaultBranchRef {
+                    target {
+                      ... on Commit {
+                        history(since: "\(since)", author: {emails: [\(emailList)]}, first: 100) {
+                          nodes { oid additions deletions committedDate messageHeadline }
+                        }
                       }
-                    """)
-                    lookups.append((alias, entry.commit))
+                    }
+                  }
+                """
+
+                // Also query dev branch if it exists and isn't the default
+                if repo.hasDevBranch && repo.defaultBranch != "dev" {
+                    branchQueries += """
+
+                      devBranch: ref(qualifiedName: "refs/heads/dev") {
+                        target {
+                          ... on Commit {
+                            history(since: "\(since)", author: {emails: [\(emailList)]}, first: 100) {
+                              nodes { oid additions deletions committedDate messageHeadline }
+                            }
+                          }
+                        }
+                      }
+                    """
                 }
 
                 fragments.append("""
                   r\(ri): repository(owner: "\(parts[0])", name: "\(parts[1])") {
-                    \(objectFragments.joined(separator: "\n"))
+                    \(branchQueries)
                   }
                 """)
             }
@@ -202,23 +147,95 @@ actor GitHubClient {
                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let dataObj = root["data"] as? [String: Any] else { continue }
 
-            // Match lookups back to results
-            for (ri, (_, entries)) in repoMap.enumerated() {
+            for (ri, repoName) in repoNames {
                 guard let repoObj = dataObj["r\(ri)"] as? [String: Any] else { continue }
-                for (ci, entry) in entries.enumerated() {
-                    guard let commitObj = repoObj["c\(ri)_\(ci)"] as? [String: Any],
-                          let added = commitObj["additions"] as? Int,
-                          let deleted = commitObj["deletions"] as? Int else { continue }
-                    results.append(StatsCommit(
-                        sha: entry.commit.sha,
-                        repo: entry.commit.repo,
-                        date: entry.commit.date,
-                        message: entry.commit.message,
-                        added: added,
-                        deleted: deleted
-                    ))
+
+                // Collect commits from default branch
+                if let branch = repoObj["defaultBranch"] as? [String: Any] {
+                    parseHistoryNodes(branch, repoName: repoName, into: &allCommits, seen: &seenSHAs)
+                }
+
+                // Collect commits from dev branch (deduped by SHA)
+                if let branch = repoObj["devBranch"] as? [String: Any] {
+                    parseHistoryNodes(branch, repoName: repoName, into: &allCommits, seen: &seenSHAs)
                 }
             }
+        }
+
+        return allCommits
+    }
+
+    private func parseHistoryNodes(_ branchObj: [String: Any], repoName: String, into commits: inout [CommitInfo], seen: inout Set<String>) {
+        guard let target = branchObj["target"] as? [String: Any],
+              let history = target["history"] as? [String: Any],
+              let nodes = history["nodes"] as? [[String: Any]] else { return }
+
+        for node in nodes {
+            guard let sha = node["oid"] as? String,
+                  !seen.contains(sha),
+                  let added = node["additions"] as? Int,
+                  let deleted = node["deletions"] as? Int,
+                  let date = node["committedDate"] as? String else { continue }
+
+            seen.insert(sha)
+            let message = node["messageHeadline"] as? String ?? ""
+            commits.append(CommitInfo(sha: sha, repo: repoName, date: date, message: message, added: added, deleted: deleted))
+        }
+    }
+
+    // MARK: - Repo discovery
+
+    private struct RepoInfo {
+        let nameWithOwner: String
+        let defaultBranch: String
+        let hasDevBranch: Bool
+    }
+
+    private func fetchRepos() -> [RepoInfo] {
+        let query = """
+        {
+          viewer {
+            repositories(first: 100, orderBy: {field: PUSHED_AT, direction: DESC}, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) {
+              nodes {
+                nameWithOwner
+                defaultBranchRef { name }
+                devRef: ref(qualifiedName: "refs/heads/dev") { name }
+              }
+            }
+            repositoriesContributedTo(first: 100, orderBy: {field: PUSHED_AT, direction: DESC}, contributionTypes: [COMMIT]) {
+              nodes {
+                nameWithOwner
+                defaultBranchRef { name }
+                devRef: ref(qualifiedName: "refs/heads/dev") { name }
+              }
+            }
+          }
+        }
+        """
+
+        guard let output = runGraphQL(query),
+              let data = output.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataObj = root["data"] as? [String: Any],
+              let viewer = dataObj["viewer"] as? [String: Any] else {
+            return []
+        }
+
+        var seen = Set<String>()
+        var results: [RepoInfo] = []
+
+        let owned = (viewer["repositories"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+        let contributed = (viewer["repositoriesContributedTo"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+
+        for node in owned + contributed {
+            guard let nameWithOwner = node["nameWithOwner"] as? String,
+                  !seen.contains(nameWithOwner) else { continue }
+            seen.insert(nameWithOwner)
+
+            let defaultBranch = (node["defaultBranchRef"] as? [String: Any])?["name"] as? String ?? "main"
+            let hasDevBranch = node["devRef"] != nil && !(node["devRef"] is NSNull)
+
+            results.append(RepoInfo(nameWithOwner: nameWithOwner, defaultBranch: defaultBranch, hasDevBranch: hasDevBranch))
         }
 
         return results
@@ -235,29 +252,6 @@ actor GitHubClient {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }()
 
-    private func runGh(_ args: [String]) -> String? {
-        guard let gh = Self.ghPath else { return nil }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: gh)
-        process.arguments = args
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
     private func runGraphQL(_ query: String) -> String? {
         guard let gh = Self.ghPath else { return nil }
 
@@ -265,8 +259,6 @@ actor GitHubClient {
         process.executableURL = URL(fileURLWithPath: gh)
         process.arguments = ["api", "graphql", "-f", "query=\(query)"]
 
-        // For large queries, write to a temp file and use --input
-        // But first try direct argument
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
@@ -281,16 +273,14 @@ actor GitHubClient {
         process.waitUntilExit()
 
         if process.terminationStatus != 0 {
-            // Query too large for args -- use stdin
-            return runGraphQLViaStdin(query)
+            return runGraphQLViaFile(query)
         }
         return String(data: data, encoding: .utf8)
     }
 
-    private func runGraphQLViaStdin(_ query: String) -> String? {
+    private func runGraphQLViaFile(_ query: String) -> String? {
         guard let gh = Self.ghPath else { return nil }
 
-        // Write query as JSON body to temp file
         let body: [String: String] = ["query": query]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         let tmpFile = "/tmp/gitcount-gql-\(UUID().uuidString).json"
@@ -317,35 +307,10 @@ actor GitHubClient {
         return String(data: data, encoding: .utf8)
     }
 
-    // MARK: - JSON parsing
-
-    private func parseSearchResults(_ json: String) -> [SearchCommit] {
-        guard let data = json.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = root["items"] as? [[String: Any]] else {
-            return []
-        }
-
-        return items.compactMap { item in
-            guard let sha = item["sha"] as? String,
-                  let repo = item["repository"] as? [String: Any],
-                  let repoName = repo["full_name"] as? String,
-                  let commit = item["commit"] as? [String: Any],
-                  let author = commit["author"] as? [String: Any],
-                  let date = author["date"] as? String,
-                  let message = commit["message"] as? String else {
-                return nil
-            }
-            let firstLine = message.components(separatedBy: "\n").first ?? message
-            return SearchCommit(sha: sha, repo: repoName, date: date, message: firstLine)
-        }
-    }
-
     // MARK: - Helpers
 
     private func fourWeeksAgoISO() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
+        let formatter = ISO8601DateFormatter()
         let date = Calendar.current.date(byAdding: .weekOfYear, value: -4, to: Date())!
         return formatter.string(from: date)
     }
