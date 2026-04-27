@@ -5,7 +5,7 @@ actor GitHubClient {
     private let repoBatchSize = 10
 
     init(emails: [String]) {
-        self.emails = emails
+        self.emails = normalizedAuthorEmails(emails)
     }
 
     // MARK: - Data types
@@ -84,10 +84,9 @@ actor GitHubClient {
 
     private func fetchAllCommits() async -> [CommitInfo] {
         let repos = fetchRepos()
-        guard !repos.isEmpty else { return [] }
+        guard !repos.isEmpty, !emails.isEmpty else { return [] }
 
         let since = fourWeeksAgoISO()
-        let emailList = emails.map { "\"\($0)\"" }.joined(separator: ", ")
         var allCommits: [CommitInfo] = []
         var seenSHAs = Set<String>()
 
@@ -109,7 +108,7 @@ actor GitHubClient {
                   defaultBranch: defaultBranchRef {
                     target {
                       ... on Commit {
-                        history(since: "\(since)", author: {emails: [\(emailList)]}, first: 100) {
+                        history(since: $since, author: {emails: $emails}, first: 100) {
                           nodes { oid additions deletions committedDate messageHeadline }
                         }
                       }
@@ -124,7 +123,7 @@ actor GitHubClient {
                       devBranch: ref(qualifiedName: "refs/heads/dev") {
                         target {
                           ... on Commit {
-                            history(since: "\(since)", author: {emails: [\(emailList)]}, first: 100) {
+                            history(since: $since, author: {emails: $emails}, first: 100) {
                               nodes { oid additions deletions committedDate messageHeadline }
                             }
                           }
@@ -140,8 +139,8 @@ actor GitHubClient {
                 """)
             }
 
-            let query = "{ \(fragments.joined(separator: "\n")) }"
-            guard let output = runGraphQL(query) else { continue }
+            let query = "query($since: GitTimestamp!, $emails: [String!]) { \(fragments.joined(separator: "\n")) }"
+            guard let output = runGraphQL(query, variables: ["since": since, "emails": emails]) else { continue }
 
             guard let data = output.data(using: .utf8),
                   let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -252,8 +251,11 @@ actor GitHubClient {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }()
 
-    private func runGraphQL(_ query: String) -> String? {
+    private func runGraphQL(_ query: String, variables: [String: Any] = [:]) -> String? {
         guard let gh = Self.ghPath else { return nil }
+        if !variables.isEmpty {
+            return runGraphQLViaFile(query, variables: variables)
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: gh)
@@ -273,18 +275,22 @@ actor GitHubClient {
         process.waitUntilExit()
 
         if process.terminationStatus != 0 {
-            return runGraphQLViaFile(query)
+            return runGraphQLViaFile(query, variables: variables)
         }
         return String(data: data, encoding: .utf8)
     }
 
-    private func runGraphQLViaFile(_ query: String) -> String? {
+    private func runGraphQLViaFile(_ query: String, variables: [String: Any] = [:]) -> String? {
         guard let gh = Self.ghPath else { return nil }
 
-        let body: [String: String] = ["query": query]
+        var body: [String: Any] = ["query": query]
+        if !variables.isEmpty {
+            body["variables"] = variables
+        }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         let tmpFile = "/tmp/gitcount-gql-\(UUID().uuidString).json"
         FileManager.default.createFile(atPath: tmpFile, contents: bodyData)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmpFile)
         defer { try? FileManager.default.removeItem(atPath: tmpFile) }
 
         let process = Process()

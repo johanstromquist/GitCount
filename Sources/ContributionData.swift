@@ -36,6 +36,28 @@ struct RepoDayDetail: Identifiable, Sendable {
     var net: Int { added - deleted }
 }
 
+private let authorEmailPattern = #"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$"#
+
+func normalizedAuthorEmails(_ emails: [String]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+
+    for email in emails {
+        let candidate = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard candidate.count <= 254,
+              candidate.range(
+                of: authorEmailPattern,
+                options: [.regularExpression, .caseInsensitive]
+              ) != nil,
+              seen.insert(candidate).inserted else {
+            continue
+        }
+        result.append(candidate)
+    }
+
+    return result
+}
+
 @Observable
 @MainActor
 final class ContributionStore {
@@ -46,7 +68,14 @@ final class ContributionStore {
     var lastRefresh: Date?
 
     var authorEmails: [String] {
-        didSet { UserDefaults.standard.set(authorEmails, forKey: Self.emailsKey) }
+        didSet {
+            let normalized = normalizedAuthorEmails(authorEmails)
+            if normalized != authorEmails {
+                authorEmails = normalized
+                return
+            }
+            UserDefaults.standard.set(authorEmails, forKey: Self.emailsKey)
+        }
     }
 
     var isConfigured: Bool {
@@ -66,7 +95,10 @@ final class ContributionStore {
     var isLoadingDetail = false
 
     init() {
-        authorEmails = UserDefaults.standard.stringArray(forKey: Self.emailsKey) ?? []
+        authorEmails = normalizedAuthorEmails(
+            UserDefaults.standard.stringArray(forKey: Self.emailsKey) ?? []
+        )
+        UserDefaults.standard.set(authorEmails, forKey: Self.emailsKey)
     }
 
     func loadDayDetail(date: String) async {
